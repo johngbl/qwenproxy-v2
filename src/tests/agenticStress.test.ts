@@ -39,6 +39,10 @@ if (fs.existsSync(SANDBOX_DIR)) {
 }
 fs.mkdirSync(SANDBOX_DIR, { recursive: true });
 
+function normalizePath(p: string): string {
+  return p.replace(/\\/g, '/').toLowerCase();
+}
+
 // Local real file system tool handlers
 const localTools = {
   list_files: () => {
@@ -47,7 +51,8 @@ const localTools = {
   },
   create_file: (args: { path: string; content: string }) => {
     const filePath = path.join(SANDBOX_DIR, args.path);
-    if (!filePath.startsWith(SANDBOX_DIR)) {
+    const basePath = normalizePath(SANDBOX_DIR) + '/';
+    if (!normalizePath(filePath).startsWith(basePath)) {
       return JSON.stringify({ error: 'Access denied: Directory traversal detected' });
     }
     fs.mkdirSync(path.dirname(filePath), { recursive: true });
@@ -56,7 +61,8 @@ const localTools = {
   },
   read_file: (args: { path: string }) => {
     const filePath = path.join(SANDBOX_DIR, args.path);
-    if (!filePath.startsWith(SANDBOX_DIR)) {
+    const basePath = normalizePath(SANDBOX_DIR) + '/';
+    if (!normalizePath(filePath).startsWith(basePath)) {
       return JSON.stringify({ error: 'Access denied: Directory traversal detected' });
     }
     if (!fs.existsSync(filePath)) {
@@ -67,7 +73,8 @@ const localTools = {
   },
   edit_file: (args: { path: string; oldText: string; newText: string }) => {
     const filePath = path.join(SANDBOX_DIR, args.path);
-    if (!filePath.startsWith(SANDBOX_DIR)) {
+    const basePath = normalizePath(SANDBOX_DIR) + '/';
+    if (!normalizePath(filePath).startsWith(basePath)) {
       return JSON.stringify({ error: 'Access denied: Directory traversal detected' });
     }
     if (!fs.existsSync(filePath)) {
@@ -82,7 +89,8 @@ const localTools = {
   },
   delete_file: (args: { path: string }) => {
     const filePath = path.join(SANDBOX_DIR, args.path);
-    if (!filePath.startsWith(SANDBOX_DIR)) {
+    const basePath = normalizePath(SANDBOX_DIR) + '/';
+    if (!normalizePath(filePath).startsWith(basePath)) {
       return JSON.stringify({ error: 'Access denied: Directory traversal detected' });
     }
     if (!fs.existsSync(filePath)) {

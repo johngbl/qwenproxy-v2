@@ -17,6 +17,7 @@ import { registry } from '../tools/registry.ts';
 import type { FunctionToolDefinition } from '../tools/types.ts';
 import { robustParseJSON } from '../utils/json.ts';
 import { StreamingToolParser } from '../tools/parser.ts';
+import { RetryableQwenStreamError } from '../services/qwen.ts';
 import { Mutex } from '../services/playwright.ts';
 
 // Global mutex that serializes ALL Qwen chat completions requests.
@@ -75,7 +76,7 @@ function parseQwenErrorPayload(raw: string): { message: string; status: number }
       const code = payload.data?.code || payload.code || 'UpstreamError';
       const details = payload.data?.details || payload.message || 'Qwen returned an error';
       const wait = payload.data?.num !== undefined ? ` Wait about ${payload.data.num} hour(s) before trying again.` : '';
-      const status = code === 'RateLimited' ? 429 : 502;
+      const status = code === 'RateLimited' ? 429 : (code === 'Not_Found' ? 404 : 502);
       return { message: `Qwen upstream error: ${code}: ${details}.${wait}`, status };
     }
     if (payload && payload.error) {
@@ -113,24 +114,46 @@ export async function chatCompletions(c: Context) {
       }
 
       if (msg.role === 'system') {
-        systemPrompt += contentStr + '\n\n';
+        systemPrompt += (contentStr || '') + '\n\n';
       } else if (msg.role === 'user') {
-        prompt += `User: ${contentStr}\n\n`;
+        prompt += `User: ${contentStr || ''}\n\n`;
       } else if (msg.role === 'assistant') {
-        let assistantContent = contentStr;
-        if ((msg as any).reasoning_content) {
-          assistantContent = `<think>\n${(msg as any).reasoning_content}\n</think>\n${assistantContent}`;
+        let assistantContent = contentStr || '';
+        const reasoning = (msg as any).reasoning_content;
+        if (reasoning) {
+          assistantContent = `<think>\n${reasoning}\n</think>\n${assistantContent}`;
         }
         if (msg.tool_calls && Array.isArray(msg.tool_calls)) {
            for (const tc of msg.tool_calls) {
-             let args = tc.function?.arguments || '{}';
-             if (typeof args !== 'string') args = JSON.stringify(args);
-             assistantContent += `\nতত{"name": "${tc.function?.name}", "arguments": ${args}}✨`;
+             const args = tc.function?.arguments;
+             let parsedArgs: any = {};
+             if (typeof args === 'string') {
+               try { parsedArgs = JSON.parse(args); } catch { parsedArgs = {}; }
+             } else if (args && typeof args === 'object') {
+               parsedArgs = args;
+             }
+             const payload = { name: tc.function?.name, arguments: parsedArgs };
+             const toolCallStr = `\n<tool_call>\n${JSON.stringify(payload)}\n</tool_call>`;
+             assistantContent = assistantContent ? assistantContent + toolCallStr : toolCallStr.trim();
            }
         }
         prompt += `Assistant: ${assistantContent.trim()}\n\n`;
       } else if (msg.role === 'tool' || msg.role === 'function') {
-        prompt += `Tool Response (${msg.name || 'tool'}): ${contentStr}\n\n`;
+        let toolName = msg.name;
+        if (!toolName && msg.tool_call_id) {
+          // Look up tool name in history by tool_call_id
+          for (let j = i - 1; j >= 0; j--) {
+            const prevMsg = messages[j];
+            if (prevMsg.role === 'assistant' && prevMsg.tool_calls) {
+              const call = prevMsg.tool_calls.find(tc => tc.id === msg.tool_call_id);
+              if (call) {
+                toolName = call.function?.name;
+                break;
+              }
+            }
+          }
+        }
+        prompt += `Tool Response (${toolName || 'tool'}): ${contentStr || ''}\n\n`;
       }
     }
 
@@ -150,7 +173,7 @@ export async function chatCompletions(c: Context) {
       });
       const toolsJson = JSON.stringify(formattedTools, null, 2);
       
-      systemPrompt += `\n\n# TOOLS AVAILABLE\nYou have access to the following tools:\n${toolsJson}\n\n# TOOL CALLING FORMAT (MANDATORY)\nTo use a tool, you MUST output a JSON object wrapped EXACTLY in these tags:\nতত\n{"name": "tool_name", "arguments": {"param_name": "value"}}✨\n\nEXAMPLE OF MULTIPLE TOOL CALLS:\nতত\n{"name": "read_file", "arguments": {"path": "file1.txt"}}✨\nতত\n{"name": "read_file", "arguments": {"path": "file2.txt"}}✨\n\nCRITICAL RULES:\n1. ONLY use the tags above for tool calling. NEVER output raw JSON without tags.\n2. You can call multiple tools by outputting multiple তত blocks consecutively.\n3. Do NOT output any other text (explanations, chat, etc.) after your তত blocks. Wait for the user to provide the tool response.\n4. The JSON inside the tags MUST be valid and include ALL required braces and the "arguments" field.\n5. If you need to use a tool, do it IMMEDIATELY without preamble.\n\n`;
+      systemPrompt += `\n\n# TOOLS AVAILABLE\nYou have access to the following tools:\n${toolsJson}\n\n# TOOL CALLING FORMAT (MANDATORY)\nTo use a tool, you MUST output a JSON object wrapped EXACTLY in these tags:\n<tool_call>\n{"name": "tool_name", "arguments": {"param_name": "value"}}\n</tool_call>\n\nEXAMPLE OF MULTIPLE TOOL CALLS:\n<tool_call>\n{"name": "read_file", "arguments": {"path": "file1.txt"}}\n</tool_call>\n<tool_call>\n{"name": "read_file", "arguments": {"path": "file2.txt"}}\n</tool_call>\n\nCRITICAL RULES:\n1. ONLY use the tags above for tool calling. NEVER output raw JSON without tags.\n2. You can call multiple tools by outputting multiple <tool_call> blocks consecutively.\n3. Do NOT output any other text (explanations, chat, etc.) after your <tool_call> blocks. Wait for the user to provide the tool response.\n4. The JSON inside the tags MUST be valid and include ALL required braces and the "arguments" field.\n5. If you need to use a tool, do it IMMEDIATELY without preamble.\n\n`;
       
       if (bodyAny.tool_choice && typeof bodyAny.tool_choice === 'object' && bodyAny.tool_choice.function) {
         const forcedTool = bodyAny.tool_choice.function.name;
@@ -186,16 +209,22 @@ export async function chatCompletions(c: Context) {
         break; // Success
       } catch (err: any) {
         retries--;
-        const isInProgress = err.message?.includes('in progress') || err.message?.includes('Bad_Request');
         if (retries === 0) {
           releaseChatLock();
           throw err;
         }
-        console.warn(`[Chat] Qwen request failed (${isInProgress ? 'in progress' : 'other'}), retrying in ${retryDelay}ms... (${retries} left)`);
-        await new Promise(r => setTimeout(r, retryDelay));
-        if (isInProgress) {
-          retryDelay = Math.min(retryDelay * 2, 10000); // Exponential backoff, max 10s
+        let useDelay = retryDelay;
+        if (err instanceof RetryableQwenStreamError && err.retryAfterMs !== undefined) {
+          useDelay = err.retryAfterMs;
         }
+        const isRetryable = err instanceof RetryableQwenStreamError || err.message?.includes('in progress') || err.message?.includes('Bad_Request');
+        if (!isRetryable) {
+          releaseChatLock();
+          throw err;
+        }
+        console.warn(`[Chat] Qwen request failed, retrying in ${useDelay}ms... (${retries} left)`);
+        await new Promise(r => setTimeout(r, useDelay));
+        retryDelay = Math.min(retryDelay * 2, 10000);
       }
     }
 
@@ -208,6 +237,7 @@ export async function chatCompletions(c: Context) {
       let currentThoughtIndex = 0;
       let reasoningBuffer = '';
       let lastFullContent = '';
+      let targetResponseId: string | null = null;
       const toolParser = new StreamingToolParser();
       const toolCallsOut: any[] = [];
       let buffer = '';
@@ -232,8 +262,12 @@ export async function chatCompletions(c: Context) {
             const chunk = JSON.parse(dataStr);
 
             if (chunk['response.created'] && chunk['response.created'].response_id) {
+              if (!targetResponseId) {
+                targetResponseId = chunk['response.created'].response_id;
+              }
               updateSessionParent(uiSessionId, chunk['response.created'].response_id);
-            } else if (chunk.response_id) {
+            } else if (chunk.response_id && !targetResponseId) {
+              targetResponseId = chunk.response_id;
               updateSessionParent(uiSessionId, chunk.response_id);
             }
 
@@ -246,7 +280,8 @@ export async function chatCompletions(c: Context) {
             let foundStr = false;
             let isThinkingChunk = false;
 
-            if (chunk.choices && chunk.choices[0] && chunk.choices[0].delta) {
+            if (chunk.choices && chunk.choices[0] && chunk.choices[0].delta && 
+                (targetResponseId === null || chunk.response_id === targetResponseId)) {
               const delta = chunk.choices[0].delta;
 
               if (delta.phase === 'thinking_summary') {
@@ -278,8 +313,7 @@ export async function chatCompletions(c: Context) {
               if (isThinkingChunk) {
                 reasoningBuffer += vStr;
               } else {
-                const { text, toolCalls } = toolParser.feed(vStr);
-                if (text) lastFullContent += '';
+                const { toolCalls } = toolParser.feed(vStr);
                 for (const tc of toolCalls) {
                   toolCallsOut.push({
                     id: tc.id,
@@ -306,7 +340,7 @@ export async function chatCompletions(c: Context) {
 
       const { text: remainingText, toolCalls: remainingToolCalls } = toolParser.flush();
       if (remainingText) {
-        // remainingText has already been preserved in lastFullContent by getIncrementalDelta/feed path when present.
+        lastFullContent += remainingText;
       }
       for (const tc of remainingToolCalls) {
         toolCallsOut.push({
@@ -351,7 +385,20 @@ export async function chatCompletions(c: Context) {
     c.header('Connection', 'keep-alive');
 
     return honoStream(c, async (streamWriter: any) => {
+      let heartbeatInterval: any;
       try {
+      // Send heartbeat to prevent Cloudflare 524 timeout
+      await streamWriter.write(': heartbeat\n\n');
+
+      // Set up a periodic heartbeat to keep the connection alive during long thinking phases
+      heartbeatInterval = setInterval(async () => {
+        try {
+          await streamWriter.write(': keep-alive\n\n');
+        } catch (e) {
+          clearInterval(heartbeatInterval);
+        }
+      }, 15000); // Every 15 seconds
+
       const writeEvent = async (data: any) => {
         await streamWriter.write(`data: ${JSON.stringify(data)}\n\n`);
       };
@@ -382,6 +429,7 @@ export async function chatCompletions(c: Context) {
       
       let reasoningBuffer = '';
       let lastFullContent = '';
+      let targetResponseId: string | null = null;
       const toolParser = new StreamingToolParser();
 
       let buffer = '';
@@ -409,10 +457,14 @@ export async function chatCompletions(c: Context) {
           try {
             const chunk = JSON.parse(dataStr);
 
-            // Extract response_id for session tracking
+            // Extract response_id for session tracking and target filtering
             if (chunk['response.created'] && chunk['response.created'].response_id) {
+              if (!targetResponseId) {
+                targetResponseId = chunk['response.created'].response_id;
+              }
               updateSessionParent(uiSessionId, chunk['response.created'].response_id);
-            } else if (chunk.response_id) {
+            } else if (chunk.response_id && !targetResponseId) {
+              targetResponseId = chunk.response_id;
               updateSessionParent(uiSessionId, chunk.response_id);
             }
 
@@ -425,7 +477,8 @@ export async function chatCompletions(c: Context) {
             let foundStr = false;
             let isThinkingChunk = false;
 
-            if (chunk.choices && chunk.choices[0] && chunk.choices[0].delta) {
+            if (chunk.choices && chunk.choices[0] && chunk.choices[0].delta && 
+                (targetResponseId === null || chunk.response_id === targetResponseId)) {
               const delta = chunk.choices[0].delta;
               
               if (delta.phase === 'thinking_summary') {
@@ -573,16 +626,29 @@ export async function chatCompletions(c: Context) {
         created: Math.floor(Date.now() / 1000),
         model: body.model,
         choices: [makeChoice({}, finalFinishReason)],
-        usage: usage
+        ...(body.stream_options?.include_usage ? {} : { usage })
       });
+
+      if (body.stream_options?.include_usage) {
+        await writeEvent({
+          id: completionId,
+          object: 'chat.completion.chunk',
+          created: Math.floor(Date.now() / 1000),
+          model: body.model,
+          choices: [],
+          usage
+        });
+      }
       await streamWriter.write('data: [DONE]\n\n');
 
       } finally {
+        clearInterval(heartbeatInterval);
         releaseChatLock();
       }
     });
   } catch (err: any) {
     console.error('Error in chatCompletions:', err);
-    return c.json({ error: { message: err.message } }, 500);
+    const status = err.upstreamStatus || 500;
+    return c.json({ error: { message: err.message } }, status);
   }
 }
